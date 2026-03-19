@@ -1,46 +1,44 @@
 #!/usr/bin/env python3
 """
 PGA Tour Leaderboard Monitor
-Polls the PGA Tour GraphQL API every 60 seconds.
-Sends email alerts when players are added or removed from the leaderboard.
+Runs once per GitHub Actions trigger, compares against saved state, emails if changed.
 """
 
 import requests
 import base64
 import gzip
 import json
-import time
+import os
 import smtplib
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-POLL_INTERVAL = 60  # seconds
-
-# PGA Tour GraphQL
 GRAPHQL_URL = "https://orchestrator.pgatour.com/graphql"
 API_KEY = "da2-gsrx5bibzbb4njvhl7t37wqyl4"
 
-# Gmail
-GMAIL_USER = "jhausknecht07@gmail.com"
-GMAIL_APP_PASSWORD = "qizb grdv zjsp dlzp"
-ALERT_TO = "jhausknecht07@gmail.com"
+GMAIL_USER = os.environ["GMAIL_USER"]
+GMAIL_APP_PASSWORD = os.environ["GMAIL_PASSWORD"]
+ALERT_TO = os.environ["GMAIL_USER"]
 
 # Tournament ID — update this each week
 # Find it in Chrome DevTools → Network → graphql → Payload on pgatour.com/leaderboard
 # Current: R2026475 = Valspar Championship (Mar 19-22, 2026)
 TOURNAMENT_ID = "R2026475"
 
+STATE_FILE = "player_state.json"
+
+# State transitions that are normal round progression — do NOT alert on these
+IGNORED_TRANSITIONS = {
+    ("NOT_STARTED", "ACTIVE"),
+    ("ACTIVE", "COMPLETE"),
+}
+
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
 
 # ─── GRAPHQL QUERY ────────────────────────────────────────────────────────────
@@ -70,32 +68,18 @@ def fetch_leaderboard(tournament_id):
         "query": QUERY,
         "variables": {"leaderboardCompressedV3Id": tournament_id},
     }
-    try:
-        r = requests.post(GRAPHQL_URL, headers=headers, json=body, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.error(f"Fetch error: {e}")
-        return None
+    r = requests.post(GRAPHQL_URL, headers=headers, json=body, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
 
 def decode_payload(b64_gzip):
-    """Base64-decode then gzip-decompress the payload field."""
-    try:
-        compressed = base64.b64decode(b64_gzip)
-        decompressed = gzip.decompress(compressed)
-        return json.loads(decompressed)
-    except Exception as e:
-        log.error(f"Decode error: {e}")
-        return None
+    compressed = base64.b64decode(b64_gzip)
+    decompressed = gzip.decompress(compressed)
+    return json.loads(decompressed)
 
 
 def extract_players(data):
-    """
-    Extract players from the leaderboard payload.
-    Returns a dict of { displayName: playerState }
-    e.g. { "Scottie Scheffler": "ACTIVE", "Jon Rahm": "WD" }
-    """
     players = {}
     for entry in data.get("players", []):
         name = entry.get("player", {}).get("displayName", "").strip()
@@ -108,99 +92,70 @@ def extract_players(data):
 # ─── EMAIL ────────────────────────────────────────────────────────────────────
 
 def send_email(subject, body):
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = GMAIL_USER
-        msg["To"] = ALERT_TO
-        msg.attach(MIMEText(body, "plain"))
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_USER, ALERT_TO, msg.as_string())
-
-        log.info(f"Email sent: {subject}")
-    except Exception as e:
-        log.error(f"Email error: {e}")
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = GMAIL_USER
+    msg["To"] = ALERT_TO
+    msg.attach(MIMEText(body, "plain"))
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_USER, ALERT_TO, msg.as_string())
+    log.info(f"Email sent: {subject}")
 
 
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info(f"Starting PGA Tour monitor — tournament {TOURNAMENT_ID}")
-    log.info(f"Polling every {POLL_INTERVAL}s  →  alerts to {ALERT_TO}")
+    # Fetch current leaderboard
+    raw = fetch_leaderboard(TOURNAMENT_ID)
+    b64 = raw["data"]["leaderboardCompressedV3"]["payload"]
+    decoded = decode_payload(b64)
+    current_players = extract_players(decoded)
+    log.info(f"Players on leaderboard: {len(current_players)}")
 
-    previous_players = None
+    # Load previous state
+    if not os.path.exists(STATE_FILE):
+        log.info("No previous state found — saving baseline.")
+        with open(STATE_FILE, "w") as f:
+            json.dump(current_players, f)
+        return
 
-    while True:
-        raw = fetch_leaderboard(TOURNAMENT_ID)
+    with open(STATE_FILE) as f:
+        previous_players = json.load(f)
 
-        if raw is None:
-            log.warning("No response — skipping this cycle")
-            time.sleep(POLL_INTERVAL)
-            continue
+    # Diff
+    prev_names = set(previous_players.keys())
+    curr_names = set(current_players.keys())
 
-        try:
-            b64 = raw["data"]["leaderboardCompressedV3"]["payload"]
-        except (KeyError, TypeError) as e:
-            log.warning(f"Unexpected response shape: {e}")
-            time.sleep(POLL_INTERVAL)
-            continue
+    added   = curr_names - prev_names
+    removed = prev_names - curr_names
 
-        decoded = decode_payload(b64)
-        if decoded is None:
-            time.sleep(POLL_INTERVAL)
-            continue
+    # Filter out normal round progression from state changes
+    state_changes = {
+        name: (previous_players[name], current_players[name])
+        for name in prev_names & curr_names
+        if previous_players[name] != current_players[name]
+        and (previous_players[name], current_players[name]) not in IGNORED_TRANSITIONS
+    }
 
-        current_players = extract_players(decoded)
-        log.info(f"Players on leaderboard: {len(current_players)}")
+    if added or removed or state_changes:
+        lines = []
+        for name in sorted(added):
+            lines.append(f"Player Added - {name}")
+        for name in sorted(removed):
+            lines.append(f"Player Removed - {name}")
+        for name, (old, new) in sorted(state_changes.items()):
+            lines.append(f"MISC. - {name}: {old} → {new}")
 
-        if previous_players is None:
-            log.info("Baseline snapshot established:")
-            for name, state in sorted(current_players.items()):
-                log.info(f"  {name} ({state})")
-            previous_players = current_players
-            time.sleep(POLL_INTERVAL)
-            continue
+        body = "\n".join(lines)
+        log.info(body)
+        send_email("PGA Tour Alert", body)
+    else:
+        log.info("No changes.")
 
-        # Detect additions and removals
-        prev_names = set(previous_players.keys())
-        curr_names = set(current_players.keys())
-
-        added   = curr_names - prev_names
-        removed = prev_names - curr_names
-
-        # Detect state changes (e.g. NOT_STARTED → WD)
-        state_changes = {
-            name: (previous_players[name], current_players[name])
-            for name in prev_names & curr_names
-            if previous_players[name] != current_players[name]
-        }
-
-        if added or removed or state_changes:
-            lines = []
-
-            for name in sorted(added):
-                lines.append(f"Player Added - {name}")
-
-            for name in sorted(removed):
-                lines.append(f"Player Removed - {name}")
-
-            for name, (old, new) in sorted(state_changes.items()):
-                lines.append(f"MISC. - {name}: {old} → {new}")
-
-            body = "\n".join(lines)
-            subject = "PGA Tour Alert"
-
-            log.info(subject)
-            print(body)
-            send_email(subject, body)
-
-            previous_players = current_players
-        else:
-            log.info("No changes.")
-
-        time.sleep(POLL_INTERVAL)
+    # Save updated state
+    with open(STATE_FILE, "w") as f:
+        json.dump(current_players, f)
 
 
 if __name__ == "__main__":
